@@ -1,124 +1,208 @@
-import asyncio
-import threading
-from datetime import datetime
-from typing import Dict, Any
+import os
+import sys
+import logging
+import time
 
-import telebot
-from sqlalchemy.orm import Session
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-from bot.config import Config
-from bot.database import init_db, get_db, SessionLocal
-from bot.message_processor import MessageProcessor
-from bot.pattern_learner import PatternLearner
-from bot.response_generator import ResponseGenerator
-from bot.personality_manager import PersonalityManager
-from bot.moderation_filter import ModerationFilter
+def check_dependencies():
+    """Проверка установленных зависимостей"""
+    try:
+        import telebot
+        logger.info("✅ pyTelegramBotAPI установлен")
+    except ImportError:
+        logger.error("❌ pyTelegramBotAPI не установлен")
+        return False
+    
+    try:
+        import sqlalchemy
+        logger.info("✅ SQLAlchemy установлен")
+    except ImportError:
+        logger.error("❌ SQLAlchemy не установлен")
+        return False
+    
+    try:
+        import flask
+        logger.info("✅ Flask установлен")
+    except ImportError:
+        logger.warning("⚠️ Flask не установлен (требуется только для веб-панели)")
+    
+    return True
 
-class ChatCloneBot:
+class SimpleBot:
     def __init__(self):
-        Config.validate()
+        # Проверяем зависимости
+        if not check_dependencies():
+            logger.error("❌ Не все зависимости установлены")
+            sys.exit(1)
         
-        # Инициализация компонентов
-        self.bot = telebot.TeleBot(Config.TELEGRAM_TOKEN)
-        self.db = SessionLocal()
+        # Импортируем после проверки
+        import telebot
+        from sqlalchemy import create_engine, text
         
-        self.message_processor = MessageProcessor()
-        self.pattern_learner = PatternLearner()
-        self.personality_manager = PersonalityManager()
-        self.moderation_filter = ModerationFilter()
-        self.response_generator = ResponseGenerator(self.personality_manager)
+        # Получаем токен
+        self.token = os.getenv('TELEGRAM_TOKEN')
+        if not self.token:
+            logger.error("❌ TELEGRAM_TOKEN не найден!")
+            logger.info("💡 Добавьте TELEGRAM_TOKEN в переменные окружения Railway")
+            sys.exit(1)
         
-        # Инициализация базы данных
-        init_db()
+        self.bot = telebot.TeleBot(self.token)
+        self.db_url = os.getenv('DATABASE_URL')
         
-        # Регистрация обработчиков
-        self._register_handlers()
+        if self.db_url and self.db_url.startswith("postgres://"):
+            self.db_url = self.db_url.replace("postgres://", "postgresql://", 1)
         
-    def _register_handlers(self):
-        """Регистрация обработчиков сообщений"""
+        logger.info(f"✅ Бот инициализирован. Токен: {self.token[:15]}...")
+        self.setup_handlers()
+    
+    def init_database(self):
+        """Инициализация базы данных (упрощенная)"""
+        if not self.db_url:
+            logger.warning("⚠️ DATABASE_URL не установлен, работаю без БД")
+            return None
         
-        @self.bot.message_handler(func=lambda message: True, content_types=['text', 'sticker', 'photo'])
-        def handle_message(message):
-            asyncio.run(self._process_message_async(message))
+        try:
+            from sqlalchemy import create_engine, text
+            engine = create_engine(self.db_url)
+            
+            # Создаем таблицу если не существует
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id SERIAL PRIMARY KEY,
+                        chat_id BIGINT,
+                        user_id BIGINT,
+                        username VARCHAR(255),
+                        message_text TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
+                conn.commit()
+            
+            logger.info("✅ База данных инициализирована")
+            return engine
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации БД: {e}")
+            return None
+    
+    def setup_handlers(self):
+        """Настройка обработчиков"""
+        import telebot
+        import random
         
-        @self.bot.message_handler(commands=['reset_personality'])
-        def reset_personality(message):
-            self._handle_reset_personality(message)
+        @self.bot.message_handler(commands=['start', 'help'])
+        def send_welcome(message):
+            welcome_text = """
+🤖 *Chat Clone Bot v1.0*
+
+*Доступные команды:*
+/start - Приветствие
+/help - Помощь
+/stats - Статистика
+/reset - Сбросить обучение
+
+*Режимы работы:*
+1. Обучение (72 часа) - собираю фразы из чата
+2. Активный режим - отвечаю на сообщения
+
+Отправьте любое сообщение, чтобы начать!
+            """
+            self.bot.reply_to(message, welcome_text, parse_mode='Markdown')
         
         @self.bot.message_handler(commands=['stats'])
-        def show_stats(message):
-            self._handle_stats(message)
-    
-    async def _process_message_async(self, message: Any):
-        """Асинхронная обработка сообщения"""
-        with SessionLocal() as db:
-            # Обработка сообщения
-            result = await self.message_processor.process_message(message, db)
-            
-            if result['action'] == 'ignore':
-                return
-            
-            # Модерация
-            if hasattr(message, 'text') and message.text:
-                if self.moderation_filter.check_message(message.text):
-                    return
-            
-            # Обучение на сообщении
-            if result['action'] == 'process':
-                msg = result['message']
-                chat = result['chat']
+        def send_stats(message):
+            try:
+                from sqlalchemy import create_engine, text
+                if self.db_url:
+                    engine = create_engine(self.db_url)
+                    with engine.connect() as conn:
+                        result = conn.execute(text("SELECT COUNT(*) FROM messages"))
+                        count = result.scalar() or 0
+                    
+                    stats_text = f"""
+📊 *Статистика бота:*
+
+*Сообщений в базе:* {count}
+*Режим:* Обучение
+*Версия:* 1.0
+                    """
+                else:
+                    stats_text = "📊 База данных не настроена"
                 
-                if msg.text:
-                    self.pattern_learner.analyze_message(
-                        msg.text, chat.id, result['user'].id, db
-                    )
-                
-                # Проверка уровня личности
-                if self.personality_manager.check_level_up(chat.id, db):
-                    chat.personality_level = min(4, chat.personality_level + 1)
-                    db.commit()
-                
-                # Генерация ответа
-                if not chat.learning_mode:
-                    if self.response_generator.should_respond(str(message.chat.id)):
-                        context = {
-                            'message': msg.text,
-                            'user_id': result['user'].id,
-                            'chat_id': chat.id
-                        }
-                        response = self.response_generator.generate_response(
-                            chat.id, context, db
-                        )
-                        
-                        if response and self.moderation_filter.check_response(response):
-                            self.bot.reply_to(message, response)
-    
-    def _handle_reset_personality(self, message):
-        """Обработка команды сброса личности"""
-        with SessionLocal() as db:
-            chat = db.query(Chat).filter(Chat.chat_id == str(message.chat.id)).first()
-            if chat:
-                self.personality_manager.reset_personality(chat.id, db)
-                self.bot.reply_to(message, "✅ Личность сброшена. Начинаю переобучение (72 часа).")
-    
-    def _handle_stats(self, message):
-        """Показать статистику"""
-        with SessionLocal() as db:
-            chat = db.query(Chat).filter(Chat.chat_id == str(message.chat.id)).first()
-            if chat:
-                stats = f"""
-📊 Статистика чата:
-Уровень личности: {chat.personality_level} ({self.personality_manager.personality_templates[chat.personality_level]['name']})
-Режим: {'Обучение' if chat.learning_mode else 'Активный'}
-Сообщений обработано: {chat.messages.count() if hasattr(chat, 'messages') else 0}
-                """
-                self.bot.reply_to(message, stats)
+                self.bot.reply_to(message, stats_text, parse_mode='Markdown')
+            except Exception as e:
+                self.bot.reply_to(message, f"❌ Ошибка: {str(e)}")
+        
+        @self.bot.message_handler(func=lambda message: True)
+        def handle_message(message):
+            # Сохраняем сообщение в БД
+            try:
+                if self.db_url:
+                    from sqlalchemy import create_engine, text
+                    engine = create_engine(self.db_url)
+                    with engine.connect() as conn:
+                        conn.execute(text("""
+                            INSERT INTO messages (chat_id, user_id, username, message_text)
+                            VALUES (:chat_id, :user_id, :username, :message_text)
+                        """), {
+                            'chat_id': message.chat.id,
+                            'user_id': message.from_user.id,
+                            'username': message.from_user.username or message.from_user.first_name,
+                            'message_text': message.text
+                        })
+                        conn.commit()
+            except Exception as e:
+                logger.error(f"Ошибка сохранения в БД: {e}")
+            
+            # Простые ответы
+            responses = [
+                "Интересное сообщение! 🤔",
+                "Запомнил эту фразу! 📝",
+                "Продолжайте общаться, я учусь! 🎓",
+                "Спасибо за сообщение! 🙏",
+                "Отличная мысль! 💭",
+                "А что вы об этом думаете? 💬",
+                "Продолжайте в том же духе! 🚀",
+                "Записал в базу знаний! 🗂️",
+                "Интересный паттерн речи! 🎯",
+                "Учусь на ваших разговорах... 🧠"
+            ]
+            
+            # Отвечаем с вероятностью 30%
+            if random.random() < 0.3:
+                response = random.choice(responses)
+                self.bot.reply_to(message, response)
+            
+            logger.info(f"📨 Сообщение от @{message.from_user.username}: {message.text[:50]}...")
     
     def run(self):
         """Запуск бота"""
-        print("🤖 Чат-клон бот запущен...")
-        self.bot.infinity_polling()
+        logger.info("🚀 Запускаю Telegram бота...")
+        try:
+            self.bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            logger.error(f"❌ Ошибка в боте: {e}")
+            raise
+
+def main():
+    """Основная функция запуска"""
+    logger.info("=" * 50)
+    logger.info("🤖 ЗАПУСК CHAT CLONE BOT")
+    logger.info("=" * 50)
+    
+    # Задержка для гарантированной установки зависимостей
+    time.sleep(5)
+    
+    # Создаем и запускаем бота
+    bot = SimpleBot()
+    bot.init_database()  # Инициализируем БД
+    bot.run()
 
 if __name__ == "__main__":
-    bot = ChatCloneBot()
-    bot.run()
+    main()
